@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -34,7 +35,7 @@ func writePlain(w http.ResponseWriter, text string) {
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
-	b, err := json.Marshal(v)
+	b, err := marshalJSON(v)
 	if err != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
@@ -95,27 +96,35 @@ func etagFor(b []byte) string {
 }
 
 func (s *Server) handleGetProfile(w http.ResponseWriter, r *http.Request) {
-	dto, etag := s.loadProfileFile()
-	w.Header().Set("ETag", etag)
+	dto, _ := s.loadProfileFile()
 	writeJSON(w, http.StatusOK, dto)
 }
 
 func (s *Server) handlePutProfile(w http.ResponseWriter, r *http.Request) {
-	if im := r.Header.Get("If-Match"); im != "" {
-		_, etag := s.loadProfileFile()
-		if im != etag {
-			w.WriteHeader(http.StatusPreconditionFailed)
-			return
-		}
+	// official [FromBody]: non-JSON content types -> 415 ProblemDetails
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeUnsupportedMediaPD(w)
+		return
 	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 64<<20))
 	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		writeBadRequestPD(w)
+		return
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		writeValidationProblem(w, [][2]string{
+			{"", "A non-empty request body is required."},
+			{"dto", "The dto field is required."},
+		})
 		return
 	}
 	var dto ProfileDto
 	if err := json.Unmarshal(body, &dto); err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		writeValidationProblem(w, [][2]string{
+			{"$", jsonBindErrorText(err, body)},
+			{"dto", "The dto field is required."},
+		})
 		return
 	}
 	if herr := s.putProfile(dto); herr != nil {
@@ -230,13 +239,18 @@ func (s *Server) putProfile(dto ProfileDto) *handlerError {
 	if dto.Size != nil {
 		rec.Size = *dto.Size
 	}
+	if !dto.HasData && typ == TypeText {
+		// inline text size is computed like C# text.Length (UTF-16 units)
+		rec.Size = int64(utf16Len(dto.Text))
+	}
 	if dto.HasData {
 		rel, err := s.store.moveToPersistent(stagingPath, fileName, typ, finalHash)
 		if err != nil {
 			return httpErr(http.StatusInternalServerError, err.Error())
 		}
 		rec.TransferDataFile = rel
-		rec.TransferDataSha256 = contentHash
+		rec.TransferDataHash = &contentHash
+		rec.TransferDataSha256 = ""
 		rec.FilePaths = []string{rel}
 		if typ != TypeText {
 			rec.Text = fileName
@@ -259,7 +273,7 @@ func (s *Server) putProfile(dto ProfileDto) *handlerError {
 		existing.LastModified = now
 		if rec.TransferDataFile != "" {
 			existing.TransferDataFile = rec.TransferDataFile
-			existing.TransferDataSha256 = rec.TransferDataSha256
+			existing.TransferDataHash = rec.TransferDataHash
 			existing.FilePaths = rec.FilePaths
 		}
 		existing.Version++
@@ -286,7 +300,7 @@ func (s *Server) putProfile(dto ProfileDto) *handlerError {
 
 func (s *Server) saveProfileAndNotify(p *ProfileDto) error {
 	// official v3.1.7/v3.3.1 does not emit syncedAt; keep parity.
-	b, err := json.Marshal(toFileDTO(*p))
+	b, err := marshalJSON(toFileDTO(*p))
 	if err != nil {
 		return err
 	}
@@ -306,6 +320,10 @@ func (s *Server) fileNameFromPath(r *http.Request) (string, bool) {
 		return "", false
 	}
 	raw := esc[len(prefix):]
+	// ASP.NET keeps the encoded slash form in route values ("a%2Fb.txt"),
+	// so preserve %2F/%2f literally through decoding.
+	raw = strings.ReplaceAll(raw, "%2F", "%252F")
+	raw = strings.ReplaceAll(raw, "%2f", "%252f")
 	name, err := url.PathUnescape(raw)
 	if err != nil || !safeFileName(name) {
 		return "", false
@@ -316,7 +334,7 @@ func (s *Server) fileNameFromPath(r *http.Request) (string, bool) {
 func (s *Server) handleFileGet(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.fileNameFromPath(r)
 	if !ok {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		writeBadRequestPD(w)
 		return
 	}
 	path := s.findRecentTransferFile(name)
@@ -324,19 +342,13 @@ func (s *Server) handleFileGet(w http.ResponseWriter, r *http.Request) {
 		writeNotFoundPD(w)
 		return
 	}
-	f, err := os.Open(path)
-	if err != nil {
-		writeNotFoundPD(w)
-		return
-	}
-	defer f.Close()
-	st, err := f.Stat()
+	b, err := os.ReadFile(path)
 	if err != nil {
 		writeNotFoundPD(w)
 		return
 	}
 	w.Header().Set("Content-Type", contentTypeFor(name))
-	http.ServeContent(w, r, name, st.ModTime(), f)
+	_, _ = w.Write(b)
 }
 
 // findRecentTransferFile mirrors HistoryService.GetRecentTransferFile: scan all
@@ -347,14 +359,14 @@ func (s *Server) findRecentTransferFile(name string) string {
 		return ""
 	}
 	rows, err := s.store.db.Query(
-		`SELECT `+recCols+` FROM HistoryRecords WHERE UserId=? ORDER BY LastAccessed DESC`,
+		`SELECT `+s.store.recCols+` FROM HistoryRecords WHERE UserId=? ORDER BY LastAccessed DESC`,
 		hardcodedUserID)
 	if err != nil {
 		return ""
 	}
 	defer rows.Close()
 	for rows.Next() {
-		rec, err := scanRecord(rows)
+		rec, err := s.store.scanRecord(rows)
 		if err != nil {
 			return ""
 		}
@@ -405,7 +417,7 @@ func (s *Server) resolveRecordDataPath(rec *Record) string {
 func (s *Server) handleFilePut(w http.ResponseWriter, r *http.Request) {
 	name, ok := s.fileNameFromPath(r)
 	if !ok {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		writeBadRequestPD(w)
 		return
 	}
 	dst := filepath.Join(s.store.fileDir(), name)

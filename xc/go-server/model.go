@@ -255,6 +255,7 @@ type Record struct {
 	Text               string
 	Size               int64
 	TransferDataFile   string // relative path "{Type}_{Hash}/{filename}"
+	TransferDataHash   *string
 	TransferDataSha256 string
 	TransferDataMd5    string
 	FilePaths          []string
@@ -273,6 +274,12 @@ type Record struct {
 
 // transferHash returns the content SHA-256 recorded for this record, if any.
 func (r *Record) transferHash() *string {
+	if r.TransferDataHash != nil {
+		if s := strings.TrimSpace(*r.TransferDataHash); s != "" {
+			v := strings.ToUpper(s)
+			return &v
+		}
+	}
 	if s := strings.TrimSpace(r.TransferDataSha256); s != "" {
 		v := strings.ToUpper(s)
 		return &v

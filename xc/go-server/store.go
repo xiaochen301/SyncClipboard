@@ -15,13 +15,14 @@ import (
 
 const hardcodedUserID = "default_user"
 
-const recCols = "ID, UserId, Type, Text, Size, TransferDataFile, TransferDataSha256, TransferDataMd5, FilePaths, Hash, CreateTime, LastAccessed, LastModified, Stared, Pinned, \"From\", Tags, ExtraData, Version, IsDeleted"
+const recColsBase = "ID, UserId, Type, Text, Size, TransferDataFile, TransferDataSha256, TransferDataMd5, FilePaths, Hash, CreateTime, LastAccessed, LastModified, Stared, Pinned, \"From\", Tags, ExtraData, Version, IsDeleted"
 
 type Store struct {
 	db           *sql.DB
 	root         string // data root (contains data/history.db, file/, history/)
 	mu           sync.Mutex
-	hasTDHashCol bool // TransferDataHash column present (added by official >= 3.3)
+	hasTDHashCol bool   // TransferDataHash column present (added by official >= 3.3)
+	recCols      string // SELECT column list (includes TransferDataHash when present)
 }
 
 func openStore(root string) (*Store, error) {
@@ -46,6 +47,11 @@ func openStore(root string) (*Store, error) {
 	}
 	st := &Store{db: db, root: root}
 	st.detectColumns()
+	st.ensureTransferDataHashColumn()
+	st.recCols = recColsBase
+	if st.hasTDHashCol {
+		st.recCols += ", TransferDataHash"
+	}
 	return st, nil
 }
 
@@ -70,6 +76,32 @@ func (s *Store) detectColumns() {
 }
 
 func (s *Store) Close() error { return s.db.Close() }
+
+// ensureTransferDataHashColumn mirrors the official EF migration
+// 20260901065719_AddHistoryTransferDataHash so the schema matches what the
+// official server produces, and records the migration row so a later official
+// container start does not try to re-apply it.
+func (s *Store) ensureTransferDataHashColumn() {
+	if s.hasTDHashCol {
+		return
+	}
+	var n int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='HistoryRecords'").Scan(&n); err != nil || n == 0 {
+		return
+	}
+	if _, err := s.db.Exec("ALTER TABLE HistoryRecords ADD COLUMN TransferDataHash TEXT"); err != nil {
+		return
+	}
+	var hn int
+	if err := s.db.QueryRow("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='__EFMigrationsHistory'").Scan(&hn); err == nil && hn > 0 {
+		var cnt int
+		_ = s.db.QueryRow("SELECT COUNT(*) FROM __EFMigrationsHistory WHERE MigrationId='20260901065719_AddHistoryTransferDataHash'").Scan(&cnt)
+		if cnt == 0 {
+			_, _ = s.db.Exec("INSERT INTO __EFMigrationsHistory (MigrationId, ProductVersion) VALUES ('20260901065719_AddHistoryTransferDataHash','9.0.20')")
+		}
+	}
+	s.hasTDHashCol = true
+}
 
 // ---------- path helpers ----------
 
@@ -116,22 +148,29 @@ func (s *Store) moveToPersistent(staging, filename string, t ProfileType, hash s
 
 type scanner interface{ Scan(dest ...any) error }
 
-func scanRecord(row scanner) (*Record, error) {
+func (s *Store) scanRecord(row scanner) (*Record, error) {
 	var r Record
 	var t, stared, pinned, isDel int64
 	var fp, tags string
-	var extra sql.NullString
+	var extra, tdh sql.NullString
 	var ct, la, lm string
-	err := row.Scan(&r.ID, &r.UserID, &t, &r.Text, &r.Size, &r.TransferDataFile,
+	dest := []any{&r.ID, &r.UserID, &t, &r.Text, &r.Size, &r.TransferDataFile,
 		&r.TransferDataSha256, &r.TransferDataMd5, &fp, &r.Hash,
-		&ct, &la, &lm, &stared, &pinned, &r.From, &tags, &extra, &r.Version, &isDel)
-	if err != nil {
+		&ct, &la, &lm, &stared, &pinned, &r.From, &tags, &extra, &r.Version, &isDel}
+	if s.hasTDHashCol {
+		dest = append(dest, &tdh)
+	}
+	if err := row.Scan(dest...); err != nil {
 		return nil, err
 	}
 	r.Type = ProfileType(t)
 	r.Stared = stared != 0
 	r.Pinned = pinned != 0
 	r.IsDeleted = isDel != 0
+	if tdh.Valid {
+		v := tdh.String
+		r.TransferDataHash = &v
+	}
 	if ct != "" {
 		r.CreateTime, _ = parseTimeFlexible(ct)
 	}
@@ -168,9 +207,9 @@ func marshalStrings(v []string) string {
 
 // GetByTypeHash mirrors the official Query (Hash LIKE hash, case-insensitive).
 func (s *Store) GetByTypeHash(t ProfileType, hash string) (*Record, error) {
-	row := s.db.QueryRow("SELECT "+recCols+" FROM HistoryRecords WHERE UserId=? AND Type=? AND Hash LIKE ? LIMIT 1",
+	row := s.db.QueryRow("SELECT "+s.recCols+" FROM HistoryRecords WHERE UserId=? AND Type=? AND Hash LIKE ? LIMIT 1",
 		hardcodedUserID, int(t), hash)
-	rec, err := scanRecord(row)
+	rec, err := s.scanRecord(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -178,8 +217,8 @@ func (s *Store) GetByTypeHash(t ProfileType, hash string) (*Record, error) {
 }
 
 func (s *Store) getByID(id int64) (*Record, error) {
-	row := s.db.QueryRow("SELECT "+recCols+" FROM HistoryRecords WHERE ID=?", id)
-	rec, err := scanRecord(row)
+	row := s.db.QueryRow("SELECT "+s.recCols+" FROM HistoryRecords WHERE ID=?", id)
+	rec, err := s.scanRecord(row)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -187,48 +226,45 @@ func (s *Store) getByID(id int64) (*Record, error) {
 }
 
 func (s *Store) Insert(rec *Record) error {
-	res, err := s.db.Exec(`INSERT INTO HistoryRecords
-		(UserId,Type,Text,Size,TransferDataFile,TransferDataSha256,TransferDataMd5,FilePaths,Hash,
-		 CreateTime,LastAccessed,LastModified,Stared,Pinned,"From",Tags,ExtraData,Version,IsDeleted)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
-		rec.UserID, int(rec.Type), rec.Text, rec.Size, rec.TransferDataFile,
+	cols := "UserId,Type,Text,Size,TransferDataFile,TransferDataSha256,TransferDataMd5,FilePaths,Hash," +
+		"CreateTime,LastAccessed,LastModified,Stared,Pinned,\"From\",Tags,ExtraData,Version,IsDeleted"
+	ph := "?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?"
+	args := []any{rec.UserID, int(rec.Type), rec.Text, rec.Size, rec.TransferDataFile,
 		rec.TransferDataSha256, rec.TransferDataMd5, marshalStrings(rec.FilePaths), rec.Hash,
 		formatDBTime(rec.CreateTime), formatDBTime(rec.LastAccessed), formatDBTime(rec.LastModified),
 		b2i(rec.Stared), b2i(rec.Pinned), rec.From, marshalStrings(rec.Tags),
-		rec.ExtraData, rec.Version, b2i(rec.IsDeleted))
+		rec.ExtraData, rec.Version, b2i(rec.IsDeleted)}
+	if s.hasTDHashCol {
+		cols += ",TransferDataHash"
+		ph += ",?"
+		args = append(args, rec.TransferDataHash)
+	}
+	res, err := s.db.Exec("INSERT INTO HistoryRecords ("+cols+") VALUES ("+ph+")", args...)
 	if err != nil {
 		return err
 	}
-	id, err := res.LastInsertId()
-	if err == nil {
+	if id, err := res.LastInsertId(); err == nil {
 		rec.ID = id
 	}
-	s.syncLegacyHashColumn(rec)
 	return nil
 }
 
-// syncLegacyHashColumn keeps the optional TransferDataHash column (added by
-// newer official versions) in sync when present.
-func (s *Store) syncLegacyHashColumn(rec *Record) {
-	if !s.hasTDHashCol || rec.TransferDataSha256 == "" || rec.ID == 0 {
-		return
-	}
-	_, _ = s.db.Exec("UPDATE HistoryRecords SET TransferDataHash=? WHERE ID=?", rec.TransferDataSha256, rec.ID)
-}
-
 func (s *Store) Update(rec *Record) error {
-	_, err := s.db.Exec(`UPDATE HistoryRecords SET
+	sqlStr := `UPDATE HistoryRecords SET
 		Type=?,Text=?,Size=?,TransferDataFile=?,TransferDataSha256=?,TransferDataMd5=?,FilePaths=?,Hash=?,
-		CreateTime=?,LastAccessed=?,LastModified=?,Stared=?,Pinned=?,"From"=?,Tags=?,ExtraData=?,Version=?,IsDeleted=?
-		WHERE ID=?`,
-		int(rec.Type), rec.Text, rec.Size, rec.TransferDataFile, rec.TransferDataSha256, rec.TransferDataMd5,
+		CreateTime=?,LastAccessed=?,LastModified=?,Stared=?,Pinned=?,"From"=?,Tags=?,ExtraData=?,Version=?,IsDeleted=?`
+	args := []any{int(rec.Type), rec.Text, rec.Size, rec.TransferDataFile, rec.TransferDataSha256, rec.TransferDataMd5,
 		marshalStrings(rec.FilePaths), rec.Hash,
 		formatDBTime(rec.CreateTime), formatDBTime(rec.LastAccessed), formatDBTime(rec.LastModified),
 		b2i(rec.Stared), b2i(rec.Pinned), rec.From, marshalStrings(rec.Tags),
-		rec.ExtraData, rec.Version, b2i(rec.IsDeleted), rec.ID)
-	if err == nil {
-		s.syncLegacyHashColumn(rec)
+		rec.ExtraData, rec.Version, b2i(rec.IsDeleted)}
+	if s.hasTDHashCol {
+		sqlStr += ",TransferDataHash=?"
+		args = append(args, rec.TransferDataHash)
 	}
+	sqlStr += " WHERE ID=?"
+	args = append(args, rec.ID)
+	_, err := s.db.Exec(sqlStr, args...)
 	return err
 }
 
@@ -292,7 +328,7 @@ func (s *Store) ListHistory(q historyQuery) ([]*Record, error) {
 		where = append(where, "LastModified >= ?")
 		args = append(args, formatDBTime(*q.ModifiedAfter))
 	}
-	query := "SELECT " + recCols + " FROM HistoryRecords WHERE " + strings.Join(where, " AND ") +
+	query := "SELECT " + s.recCols + " FROM HistoryRecords WHERE " + strings.Join(where, " AND ") +
 		" ORDER BY " + timeCol + " DESC, ID DESC LIMIT 50 OFFSET ?"
 	args = append(args, (q.Page-1)*50)
 	rows, err := s.db.Query(query, args...)
@@ -302,7 +338,7 @@ func (s *Store) ListHistory(q historyQuery) ([]*Record, error) {
 	defer rows.Close()
 	var out []*Record
 	for rows.Next() {
-		rec, err := scanRecord(rows)
+		rec, err := s.scanRecord(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -336,13 +372,13 @@ func (s *Store) ActiveCount() (int, error) {
 
 // DeleteAll removes all rows and returns the removed records.
 func (s *Store) DeleteAll() ([]*Record, error) {
-	rows, err := s.db.Query("SELECT "+recCols+" FROM HistoryRecords WHERE UserId=?", hardcodedUserID)
+	rows, err := s.db.Query("SELECT "+s.recCols+" FROM HistoryRecords WHERE UserId=?", hardcodedUserID)
 	if err != nil {
 		return nil, err
 	}
 	var recs []*Record
 	for rows.Next() {
-		rec, err := scanRecord(rows)
+		rec, err := s.scanRecord(rows)
 		if err != nil {
 			rows.Close()
 			return nil, err
@@ -363,7 +399,7 @@ func (s *Store) selectOldest(extraWhere string, extraArgs []any, limit int) ([]*
 	args := []any{hardcodedUserID}
 	args = append(args, extraArgs...)
 	args = append(args, limit)
-	q := "SELECT " + recCols + " FROM HistoryRecords WHERE UserId=? AND Stared=0 AND Pinned=0 AND IsDeleted=0" +
+	q := "SELECT " + s.recCols + " FROM HistoryRecords WHERE UserId=? AND Stared=0 AND Pinned=0 AND IsDeleted=0" +
 		extraWhere + " ORDER BY " + order + " LIMIT ?"
 	rows, err := s.db.Query(q, args...)
 	if err != nil {
@@ -372,7 +408,7 @@ func (s *Store) selectOldest(extraWhere string, extraArgs []any, limit int) ([]*
 	defer rows.Close()
 	var out []*Record
 	for rows.Next() {
-		rec, err := scanRecord(rows)
+		rec, err := s.scanRecord(rows)
 		if err != nil {
 			return nil, err
 		}
@@ -383,7 +419,7 @@ func (s *Store) selectOldest(extraWhere string, extraArgs []any, limit int) ([]*
 
 // SelectDeletedBefore returns deleted tombstones older than cutoff.
 func (s *Store) SelectDeletedBefore(cutoff time.Time) ([]*Record, error) {
-	rows, err := s.db.Query("SELECT "+recCols+" FROM HistoryRecords WHERE UserId=? AND IsDeleted=1 AND LastModified < ?",
+	rows, err := s.db.Query("SELECT "+s.recCols+" FROM HistoryRecords WHERE UserId=? AND IsDeleted=1 AND LastModified < ?",
 		hardcodedUserID, formatDBTime(cutoff))
 	if err != nil {
 		return nil, err
@@ -391,7 +427,7 @@ func (s *Store) SelectDeletedBefore(cutoff time.Time) ([]*Record, error) {
 	defer rows.Close()
 	var out []*Record
 	for rows.Next() {
-		rec, err := scanRecord(rows)
+		rec, err := s.scanRecord(rows)
 		if err != nil {
 			return nil, err
 		}

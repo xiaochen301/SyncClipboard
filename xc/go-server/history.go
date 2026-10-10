@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
+	"mime"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -77,47 +79,69 @@ func (s *Server) readFormValues(r *http.Request) (map[string][]string, error) {
 // ---------- query ----------
 
 func (s *Server) handleHistoryQuery(w http.ResponseWriter, r *http.Request) {
-	vals, err := s.readFormValues(r)
-	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
-		return
-	}
+	vals, _ := s.readFormValues(r) // form parse errors are tolerated like the official binder
 	q := historyQuery{Page: 1, Types: 0xF}
+	var verrs [][2]string
+	addErr := func(field, val string) {
+		verrs = append(verrs, [2]string{field, "The value '" + val + "' is not valid for " + field + "."})
+	}
 	if v := firstForm(vals, "Page"); v != "" {
 		if n, err := parseIntSafe(v); err == nil {
 			q.Page = n
+		} else {
+			addErr("Page", v)
 		}
 	}
 	if v := firstForm(vals, "Before"); v != "" {
 		if t, ok := parseTimeFlexible(v); ok {
 			q.Before = &t
+		} else {
+			addErr("Before", v)
 		}
 	}
 	if v := firstForm(vals, "After"); v != "" {
 		if t, ok := parseTimeFlexible(v); ok {
 			q.After = &t
+		} else {
+			addErr("After", v)
 		}
 	}
 	if v := firstForm(vals, "ModifiedAfter"); v != "" {
 		if t, ok := parseTimeFlexible(v); ok {
 			q.ModifiedAfter = &t
+		} else {
+			addErr("ModifiedAfter", v)
 		}
 	}
 	if v := firstForm(vals, "Types"); v != "" {
 		if m, ok := parseTypeFilter(v); ok {
 			q.Types = m
+		} else {
+			addErr("Types", v)
 		}
 	}
 	q.SearchText = firstForm(vals, "SearchText")
 	if v := firstForm(vals, "Starred"); v != "" {
 		if b, err := parseBoolSafe(v); err == nil {
 			q.Starred = &b
+		} else {
+			addErr("Starred", v)
 		}
 	}
 	if v := firstForm(vals, "SortByLastAccessed"); v != "" {
 		if b, err := parseBoolSafe(v); err == nil {
 			q.SortByLastAccessed = b
+		} else {
+			addErr("SortByLastAccessed", v)
 		}
+	}
+	if len(verrs) > 0 {
+		writeValidationProblem(w, verrs)
+		return
+	}
+	if q.Before != nil && q.After != nil && !q.After.Before(*q.Before) {
+		writeErr(w, http.StatusBadRequest, "after must be less than before")
+		return
 	}
 	recs, err := s.store.ListHistory(q)
 	if err != nil {
@@ -192,28 +216,28 @@ func (s *Server) handleHistoryData(w http.ResponseWriter, r *http.Request, profi
 			"Stored transfer data is invalid and cannot be regenerated.", "history_data_invalid")
 		return
 	}
-	f, err := os.Open(full)
+	b, err := os.ReadFile(full)
 	if err != nil {
 		writeProblem(w, http.StatusUnprocessableEntity, "History transfer data is invalid",
 			"Stored transfer data is invalid and cannot be regenerated.", "history_data_invalid")
-		return
-	}
-	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 		return
 	}
 	name := filepath.Base(full)
 	// official serves a freshly computed SHA-256; emit the exact header casing.
 	if actual, err := sha256File(full); err == nil {
 		w.Header()["X-SyncClipboard-Transfer-Data-Hash"] = []string{actual}
+		// official PrepareTransferData backfills TransferDataHash into the row
+		if rec.TransferDataHash == nil || !strings.EqualFold(*rec.TransferDataHash, actual) {
+			v := actual
+			rec.TransferDataHash = &v
+			_ = s.store.Update(rec)
+		}
 	} else if h := rec.transferHash(); h != nil {
 		w.Header()["X-SyncClipboard-Transfer-Data-Hash"] = []string{*h}
 	}
 	setAttachmentDisposition(w, name)
 	w.Header().Set("Content-Type", contentTypeFor(name))
-	http.ServeContent(w, r, name, st.ModTime(), f)
+	_, _ = w.Write(b)
 }
 
 func setAttachmentDisposition(w http.ResponseWriter, name string) {
@@ -251,7 +275,7 @@ func writeProblem(w http.ResponseWriter, status int, title, detail, code string)
 		Detail string `json:"detail"`
 		Code   string `json:"code"`
 	}{Title: title, Status: status, Detail: detail, Code: code}
-	b, _ := json.Marshal(body)
+	b, _ := marshalJSON(body)
 	w.Header().Set("Content-Type", "application/problem+json; charset=utf-8")
 	w.WriteHeader(status)
 	_, _ = w.Write(b)
@@ -270,7 +294,7 @@ func writeNotFoundPD(w http.ResponseWriter) {
 		Status:  http.StatusNotFound,
 		TraceID: newTraceID(),
 	}
-	b, _ := json.Marshal(body)
+	b, _ := marshalJSON(body)
 	w.Header().Set("Content-Type", "application/problem+json; charset=utf-8")
 	w.WriteHeader(http.StatusNotFound)
 	_, _ = w.Write(b)
@@ -284,13 +308,24 @@ func newTraceID() string {
 // ---------- create (multipart) ----------
 
 func (s *Server) handleHistoryCreate(w http.ResponseWriter, r *http.Request) {
-	if !strings.HasPrefix(strings.ToLower(r.Header.Get("Content-Type")), "multipart/form-data") {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+	ct := r.Header.Get("Content-Type")
+	if ct == "" {
+		// official: parsing a missing Content-Type throws -> 500
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	if !strings.HasPrefix(strings.ToLower(ct), "multipart/form-data") {
+		// [Consumes("multipart/form-data")] filter -> empty 415
+		w.WriteHeader(http.StatusUnsupportedMediaType)
+		return
+	}
+	if _, params, err := mime.ParseMediaType(ct); err != nil || params["boundary"] == "" {
+		writeErr(w, http.StatusBadRequest, "Invalid or missing multipart/form-data boundary")
 		return
 	}
 	mr, err := r.MultipartReader()
 	if err != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+		writeErr(w, http.StatusBadRequest, "Invalid or missing multipart/form-data boundary")
 		return
 	}
 	fields := map[string]string{}
@@ -306,7 +341,7 @@ func (s *Server) handleHistoryCreate(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			writeErr(w, http.StatusInternalServerError, "Internal server error: "+err.Error())
 			return
 		}
 		name := p.FormName()
@@ -337,29 +372,29 @@ func (s *Server) handleHistoryCreate(w http.ResponseWriter, r *http.Request) {
 
 	typ, ok := parseProfileTypeString(strings.TrimSpace(fields["type"]))
 	if !ok || typ == TypeNone || typ == TypeUnknown {
-		http.Error(w, "Type is invalid or missing", http.StatusBadRequest)
+		writeErr(w, http.StatusBadRequest, "Type is invalid or missing")
 		return
 	}
 	hash := strings.ToUpper(strings.TrimSpace(fields["hash"]))
 	if hash == "" {
-		http.Error(w, "hash is required", http.StatusBadRequest)
+		writeErr(w, http.StatusBadRequest, "hash is required")
 		return
 	}
 	var declared *string
 	if hdrVals := r.Header.Values(transferHashHeader); len(hdrVals) > 0 {
 		if len(hdrVals) != 1 {
-			http.Error(w, transferHashHeader+" must contain exactly one value", http.StatusBadRequest)
+			writeErr(w, http.StatusBadRequest, transferHashHeader+" must contain exactly one value")
 			return
 		}
 		n, err := normalizeSHA256(strings.TrimSpace(hdrVals[0]))
 		if err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
+			writeErr(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		declared = &n
 	}
 	if tmpPath == "" && declared != nil {
-		http.Error(w, transferHashHeader+" cannot be set without transfer data", http.StatusBadRequest)
+		writeErr(w, http.StatusBadRequest, transferHashHeader+" cannot be set without transfer data")
 		return
 	}
 
@@ -550,7 +585,8 @@ func (s *Server) saveTransferDataAsync(rec *Record, declared *string, tmpPath, o
 		}
 	}
 	rec.TransferDataFile = fn
-	rec.TransferDataSha256 = actual
+	rec.TransferDataHash = &actual
+	rec.TransferDataSha256 = ""
 	rec.FilePaths = []string{fn}
 	if rec.Type != TypeText {
 		rec.Text = fn
@@ -565,7 +601,7 @@ func (s *Server) addNewRecordDto(incoming *Record, declared *string, tmpPath, or
 			return nil, herr
 		}
 	} else {
-		rec.TransferDataSha256 = ""
+		rec.TransferDataHash = nil
 		switch rec.Type {
 		case TypeText:
 			h := sha256Bytes([]byte(rec.Text))
@@ -593,17 +629,35 @@ func (s *Server) addNewRecordDto(incoming *Record, declared *string, tmpPath, or
 func (s *Server) handleHistoryPatch(w http.ResponseWriter, r *http.Request, typeStr, hash string) {
 	typ, ok := parseProfileTypeString(typeStr)
 	if !ok {
-		// route model binding is case-insensitive
-		typ, ok = parseProfileTypeLower(typeStr)
+		typ, ok = parseProfileTypeLower(typeStr) // route model binding is case-insensitive
 		if !ok {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
+			writeValidationProblem(w, [][2]string{{"type", "The value '" + typeStr + "' is not valid."}})
 			return
 		}
 	}
-	var dto HistoryRecordUpdateDto
+	if !isJSONContentType(r.Header.Get("Content-Type")) {
+		writeUnsupportedMediaPD(w)
+		return
+	}
 	body, err := io.ReadAll(io.LimitReader(r.Body, 16<<20))
-	if err != nil || json.Unmarshal(body, &dto) != nil {
-		http.Error(w, "Bad Request", http.StatusBadRequest)
+	if err != nil {
+		writeBadRequestPD(w)
+		return
+	}
+	trimmed := bytes.TrimSpace(body)
+	if len(trimmed) == 0 || string(trimmed) == "null" {
+		writeValidationProblem(w, [][2]string{
+			{"", "A non-empty request body is required."},
+			{"dto", "The dto field is required."},
+		})
+		return
+	}
+	var dto HistoryRecordUpdateDto
+	if err := json.Unmarshal(body, &dto); err != nil {
+		writeValidationProblem(w, [][2]string{
+			{"$", jsonBindErrorText(err, body)},
+			{"dto", "The dto field is required."},
+		})
 		return
 	}
 	rec, err := s.store.GetByTypeHash(typ, hash)

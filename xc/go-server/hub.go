@@ -203,7 +203,7 @@ func (c *hubConn) finish() {
 
 // Broadcast sends a SignalR invocation frame to every connected client.
 func (h *Hub) Broadcast(target string, arg any) {
-	frame, err := json.Marshal(struct {
+	frame, err := marshalJSON(struct {
 		Type      int    `json:"type"`
 		Target    string `json:"target"`
 		Arguments []any  `json:"arguments"`

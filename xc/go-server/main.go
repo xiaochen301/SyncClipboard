@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"encoding/base64"
 	"flag"
 	"log"
 	"net/http"
@@ -42,9 +43,13 @@ func main() {
 	defer store.Close()
 
 	srv := &Server{cfg: cfg, store: store, hub: newHub(*verbose), verbose: *verbose}
+	api := srv.router()
 	httpSrv := &http.Server{
-		Addr:              *listen,
-		Handler:           srv.authAll(srv.router()),
+		Addr: *listen,
+		Handler: http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			srv.authHeaderPrecheck(w, r)
+			api.ServeHTTP(w, r)
+		}),
 		ReadHeaderTimeout: 20 * time.Second,
 	}
 
@@ -77,68 +82,265 @@ func safe(fn func()) {
 	fn()
 }
 
+// authed returns true when the request passed Basic auth; otherwise it writes
+// the official response (401 with WWW-Authenticate, or 500 for malformed Basic
+// credentials that make the official handler throw) and returns false.
+func (s *Server) authed(w http.ResponseWriter, r *http.Request) bool {
+	hdr := r.Header.Get("Authorization")
+	if len(hdr) < 5 || !strings.EqualFold(hdr[:5], "basic") {
+		w.Header().Set("WWW-Authenticate", `Basic realm="SyncClipboard"`)
+		w.WriteHeader(http.StatusUnauthorized)
+		return false
+	}
+	if len(hdr) < 6 { // official: substring past end throws -> 500
+		w.WriteHeader(http.StatusInternalServerError)
+		return false
+	}
+	token := strings.TrimSpace(hdr[6:])
+	raw, err := base64.StdEncoding.DecodeString(token)
+	if err != nil { // official: FormatException -> 500
+		w.WriteHeader(http.StatusInternalServerError)
+		return false
+	}
+	parts := strings.Split(string(raw), ":")
+	if len(parts) < 2 { // official: index out of range -> 500
+		w.WriteHeader(http.StatusInternalServerError)
+		return false
+	}
+	if parts[0] == s.cfg.User && parts[1] == s.cfg.Password {
+		return true
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="SyncClipboard"`)
+	w.WriteHeader(http.StatusUnauthorized)
+	return false
+}
+
+// authHeaderPrecheck replicates the official auth handler's side effect: any
+// request without valid Basic credentials carries a WWW-Authenticate header on
+// whatever response (401/404/405) it ends up with.
+func (s *Server) authHeaderPrecheck(w http.ResponseWriter, r *http.Request) {
+	hdr := r.Header.Get("Authorization")
+	if len(hdr) < 5 || !strings.EqualFold(hdr[:5], "basic") {
+		w.Header().Set("WWW-Authenticate", `Basic realm="SyncClipboard"`)
+		return
+	}
+	if len(hdr) < 6 {
+		return
+	}
+	token := strings.TrimSpace(hdr[6:])
+	raw, err := base64.StdEncoding.DecodeString(token)
+	if err != nil {
+		return
+	}
+	parts := strings.Split(string(raw), ":")
+	if len(parts) < 2 {
+		return
+	}
+	if parts[0] == s.cfg.User && parts[1] == s.cfg.Password {
+		return
+	}
+	w.Header().Set("WWW-Authenticate", `Basic realm="SyncClipboard"`)
+}
+
+// do405 mirrors ASP.NET routing's 405 (empty body, Allow header).
+func do405(w http.ResponseWriter, allow string) {
+	if allow != "" {
+		w.Header().Set("Allow", allow)
+	}
+	w.WriteHeader(http.StatusMethodNotAllowed)
+}
+
 func (s *Server) router() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p := r.URL.Path
 		if len(p) > 1 {
 			p = strings.TrimSuffix(p, "/")
 		}
+		m := r.Method
 		switch {
 		case p == "/" || p == "":
-			switch r.Method {
-			case http.MethodGet, http.MethodHead:
-				s.handleRoot(w, r)
+			switch m {
+			case http.MethodGet:
+				if s.authed(w, r) {
+					s.handleRoot(w, r)
+				}
 			case "PROPFIND":
-				s.handlePropfind(w, r)
+				if s.authed(w, r) {
+					s.handlePropfind(w, r)
+				}
 			default:
-				w.WriteHeader(http.StatusNotFound)
+				do405(w, "GET, PROPFIND")
 			}
 		case p == "/SyncClipboard.json":
-			switch r.Method {
-			case http.MethodGet, http.MethodHead:
-				s.handleGetProfile(w, r)
+			switch m {
+			case http.MethodGet:
+				if s.authed(w, r) {
+					s.handleGetProfile(w, r)
+				}
 			case http.MethodPut:
-				s.handlePutProfile(w, r)
+				if s.authed(w, r) {
+					s.handlePutProfile(w, r)
+				}
 			default:
-				w.WriteHeader(http.StatusNotFound)
+				do405(w, "GET, PUT")
 			}
 		case p == "/file":
-			switch r.Method {
-			case "PROPFIND", "MKCOL", http.MethodGet, http.MethodHead:
-				s.handleFileFolderEnsure(w, r)
+			switch m {
+			case "PROPFIND", "MKCOL":
+				if s.authed(w, r) {
+					s.handleFileFolderEnsure(w, r)
+				}
 			case http.MethodDelete:
-				s.handleFileFolderDelete(w, r)
+				if s.authed(w, r) {
+					s.handleFileFolderDelete(w, r)
+				}
 			default:
-				w.WriteHeader(http.StatusNotFound)
+				do405(w, "DELETE, MKCOL, PROPFIND")
 			}
 		case strings.HasPrefix(p, "/file/"):
-			switch r.Method {
+			switch m {
 			case http.MethodGet, http.MethodHead:
-				s.handleFileGet(w, r)
+				if s.authed(w, r) {
+					s.handleFileGet(w, r)
+				}
 			case http.MethodPut:
-				s.handleFilePut(w, r)
+				if s.authed(w, r) {
+					s.handleFilePut(w, r)
+				}
+			default:
+				do405(w, "GET, HEAD, PUT")
+			}
+		case p == "/api/version":
+			switch m {
+			case http.MethodGet:
+				if s.authed(w, r) {
+					writePlain(w, s.cfg.ServerVersion)
+				}
+			default:
+				do405(w, "GET")
+			}
+		case p == "/api/time":
+			switch m {
+			case http.MethodGet:
+				if s.authed(w, r) {
+					w.Header().Set("Content-Type", "application/json; charset=utf-8")
+					_, _ = w.Write([]byte(`"` + formatAPITime(time.Now().UTC()) + `"`))
+				}
+			default:
+				do405(w, "GET")
+			}
+		case p == "/api/history":
+			switch m {
+			case http.MethodPost:
+				if s.authed(w, r) {
+					s.handleHistoryCreate(w, r)
+				}
+			default:
+				do405(w, "POST")
+			}
+		case p == "/api/history/query":
+			switch m {
+			case http.MethodPost:
+				if s.authed(w, r) {
+					s.handleHistoryQuery(w, r)
+				}
+			case http.MethodGet:
+				if s.authed(w, r) {
+					s.handleHistoryGet(w, r, "query")
+				}
+			default:
+				do405(w, "GET, POST")
+			}
+		case p == "/api/history/statistics":
+			switch m {
+			case http.MethodGet:
+				if s.authed(w, r) {
+					s.handleHistoryStatistics(w, r)
+				}
+			default:
+				do405(w, "GET")
+			}
+		case p == "/api/history/clear":
+			switch m {
+			case http.MethodDelete:
+				if s.authed(w, r) {
+					s.handleHistoryClear(w, r)
+				}
+			case http.MethodGet:
+				if s.authed(w, r) {
+					s.handleHistoryGet(w, r, "clear")
+				}
+			default:
+				do405(w, "DELETE, GET")
+			}
+		case strings.HasPrefix(p, "/api/history/"):
+			rest := strings.TrimPrefix(p, "/api/history/")
+			seg := strings.Split(rest, "/")
+			switch len(seg) {
+			case 1:
+				switch m {
+				case http.MethodGet:
+					if s.authed(w, r) {
+						s.handleHistoryGet(w, r, seg[0])
+					}
+				default:
+					do405(w, "GET")
+				}
+			case 2:
+				if seg[1] == "data" {
+					switch m {
+					case http.MethodGet:
+						if s.authed(w, r) {
+							s.handleHistoryData(w, r, seg[0])
+						}
+					case http.MethodPatch:
+						if s.authed(w, r) {
+							s.handleHistoryPatch(w, r, seg[0], seg[1])
+						}
+					default:
+						do405(w, "GET, PATCH")
+					}
+				} else {
+					switch m {
+					case http.MethodPatch:
+						if s.authed(w, r) {
+							s.handleHistoryPatch(w, r, seg[0], seg[1])
+						}
+					default:
+						do405(w, "PATCH")
+					}
+				}
 			default:
 				w.WriteHeader(http.StatusNotFound)
 			}
-		case p == "/api/version" && (r.Method == http.MethodGet || r.Method == http.MethodHead):
-			writePlain(w, s.cfg.ServerVersion)
-		case p == "/api/time" && r.Method == http.MethodGet:
-			w.Header().Set("Content-Type", "application/json; charset=utf-8")
-			_, _ = w.Write([]byte(`"` + formatAPITime(time.Now().UTC()) + `"`))
-		case p == "/api/history" || strings.HasPrefix(p, "/api/history/"):
-			s.handleHistory(w, r)
 		case p == "/SyncClipboardHub/negotiate":
-			if r.Method == http.MethodPost {
-				s.hub.handleNegotiate(w, r)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
+			switch m {
+			case http.MethodPost:
+				if s.authed(w, r) {
+					s.hub.handleNegotiate(w, r)
+				}
+			default:
+				w.Header().Set("Content-Type", "text/plain")
+				w.WriteHeader(http.StatusMethodNotAllowed)
 			}
 		case p == "/SyncClipboardHub":
-			if r.Method == http.MethodGet {
-				s.hub.handleWS(w, r)
-			} else {
-				w.WriteHeader(http.StatusNotFound)
+			if m != http.MethodGet {
+				do405(w, "GET")
+				return
 			}
+			if !s.authed(w, r) {
+				return
+			}
+			if !strings.EqualFold(r.Header.Get("Upgrade"), "websocket") {
+				w.Header().Set("Content-Type", "text/plain")
+				w.Header().Set("Cache-Control", "no-cache, no-store")
+				w.Header().Set("Expires", "Thu, 01 Jan 1970 00:00:00 GMT")
+				w.Header().Set("Pragma", "no-cache")
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte("Connection ID required"))
+				return
+			}
+			s.hub.handleWS(w, r)
 		default:
 			w.WriteHeader(http.StatusNotFound)
 		}

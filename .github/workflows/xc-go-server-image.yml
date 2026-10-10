@@ -1,0 +1,55 @@
+name: xc go-server image
+
+# Builds the Go edition of the SyncClipboard server and publishes it to GHCR:
+#   ghcr.io/xiaochen301/syncclipboard-server-xc:latest
+#   ghcr.io/xiaochen301/syncclipboard-server-xc:sha-<commit12>
+# Deploy side only swaps the compose `image:` line and pulls.
+
+permissions:
+  contents: read
+  packages: write
+
+on:
+  push:
+    branches:
+      - xc/go-server
+    paths:
+      - 'xc/go-server/**'
+      - '.github/workflows/xc-go-server-image.yml'
+  workflow_dispatch:
+
+env:
+  IMAGE: ghcr.io/xiaochen301/syncclipboard-server-xc
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build image
+        run: |
+          docker build \
+            -t "$IMAGE:latest" \
+            -t "$IMAGE:sha-${GITHUB_SHA::12}" \
+            xc/go-server
+          docker run --rm "$IMAGE:sha-${GITHUB_SHA::12}" -h 2>&1 | head -5 || true
+
+      - name: Push image
+        run: |
+          docker push "$IMAGE:latest"
+          docker push "$IMAGE:sha-${GITHUB_SHA::12}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### xc go-server image"
+            echo ""
+            echo "- \`$IMAGE:latest\`"
+            echo "- \`$IMAGE:sha-${GITHUB_SHA::12}\`"
+            echo "- binary: $(docker run --rm --entrypoint sh "$IMAGE:sha-${GITHUB_SHA::12}" -c 'ls -la /usr/local/bin/syncclipboard-server-xc')"
+          } >> "$GITHUB_STEP_SUMMARY"

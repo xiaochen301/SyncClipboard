@@ -75,3 +75,29 @@ synccheck -mode write -base http://127.0.0.1:5033 -user U -pass P   # write path
 
 `http` mode is safe against production; `write` mode creates/patch records and
 must only be used against throwaway copies.
+
+## Container image
+
+CI (`.github/workflows/xc-go-server-image.yml`) builds and publishes the image
+on every push under `xc/go-server/`:
+
+```
+ghcr.io/xiaochen301/syncclipboard-server-xc:latest
+ghcr.io/xiaochen301/syncclipboard-server-xc:sha-<commit12>
+```
+
+Static binary on alpine: ~39 MB pulled, ~10 MB RSS at runtime. Pull-and-run
+(mirrors the official compose layout — `/app/data`, `/app/appsettings.json`):
+
+```
+docker run -d \
+  --name syncclipboard-server \
+  -p 127.0.0.1:5033:5033 \
+  -v ./data/appsettings.json:/app/appsettings.json \
+  -v ./data:/app/data \
+  ghcr.io/xiaochen301/syncclipboard-server-xc:latest
+```
+
+Default container args: `-data /app/data/server -config /app/appsettings.json
+-listen 0.0.0.0:5033` (override via `command:`). Deploy-side upgrade is just
+`docker compose pull && docker compose up -d`.
